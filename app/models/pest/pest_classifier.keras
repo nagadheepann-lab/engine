@@ -1,0 +1,254 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import yaml # Added for parsing data.yaml
+from glob import glob # Added for path globbing
+import kagglehub # Added for downloading dataset
+
+print("TensorFlow version:", tf.__version__)
+print("KaggleHub version:", kagglehub.__version__)
+
+# Download the dataset using kagglehub
+path = kagglehub.dataset_download("leonidkulyk/ip102-yolov5")
+DATA_DIR_DOWNLOADED = str(path)
+
+print("Downloaded dataset base path:", DATA_DIR_DOWNLOADED)
+
+# --- Debugging: List contents of the downloaded directory ---
+print("\nContents of downloaded directory (first 3 levels):")
+for root_dir, dirs, files in os.walk(DATA_DIR_DOWNLOADED):
+    level = root_dir.replace(DATA_DIR_DOWNLOADED, '').count(os.sep)
+    if level > 2: # Limit depth to avoid excessively long output
+        continue
+    indent = ' ' * 4 * (level)
+    print(f'{indent}{os.path.basename(root_dir)}/')
+    subindent = ' ' * 4 * (level + 1)
+    for d in dirs:
+        print(f'{subindent}{d}/')
+    for f in files:
+        print(f'{subindent}{f}')
+print("--- End of directory listing ---")
+
+# Determine the actual root directory for the YOLOv5 dataset structure.
+# We will search for ip102.yaml and then validate its parent directory.
+
+ACTUAL_DATA_ROOT = None
+
+# Search for all ip102.yaml files within the downloaded directory
+all_yaml_paths = glob(os.path.join(DATA_DIR_DOWNLOADED, '**', 'ip102.yaml'), recursive=True)
+
+print(f"Found ip102.yaml paths: {all_yaml_paths}") # Debugging line
+
+if all_yaml_paths:
+    for yaml_path in all_yaml_paths:
+        potential_root = os.path.dirname(yaml_path)
+        # Check if 'images' and 'labels' subdirectories exist in this potential_root
+        if os.path.exists(os.path.join(potential_root, 'images')) and \
+           os.path.exists(os.path.join(potential_root, 'labels')):
+            ACTUAL_DATA_ROOT = potential_root
+            break # Found the most likely root
+
+if ACTUAL_DATA_ROOT is None:
+    raise FileNotFoundError(f"Could not find a valid YOLOv5 dataset root (containing images, labels, and ip102.yaml or its parent) within {DATA_DIR_DOWNLOADED}. Please check the dataset's internal structure.")
+
+print(f"Actual dataset root (containing images, labels, and ip102.yaml): {ACTUAL_DATA_ROOT}")
+
+# Define image size for preprocessing
+IMAGE_SIZE = 128
+BATCH_SIZE = 32
+
+# Function to parse YOLO dataset for classification
+def parse_yolo_dataset(data_root_dir, img_size):
+    # Search for ip102.yaml within the identified data_root_dir
+    found_yaml_files = glob(os.path.join(data_root_dir, '**', 'ip102.yaml'), recursive=True)
+
+    if not found_yaml_files:
+        raise FileNotFoundError(f"ip102.yaml not found anywhere within {data_root_dir}. Expected it to be present for class definitions.")
+
+    # Assuming there's only one relevant ip102.yaml or the first one found is the correct one
+    yaml_path = found_yaml_files[0]
+    print(f"Found ip102.yaml at: {yaml_path}")
+
+    with open(yaml_path, 'r') as f:
+        data_yaml = yaml.safe_load(f)
+    class_names = data_yaml['names']
+    num_classes = len(class_names)
+
+    def load_subset_paths_and_labels(subset_name):
+        image_paths = []
+        labels = []
+        # Correct paths: data_root_dir/images/subset_name and data_root_dir/labels/subset_name
+        img_subset_dir = os.path.join(data_root_dir, 'images', subset_name)
+        label_subset_dir = os.path.join(data_root_dir, 'labels', subset_name)
+
+        if not os.path.exists(img_subset_dir):
+            print(f"Warning: Image directory {img_subset_dir} not found for subset {subset_name}. Skipping.")
+            return [], []
+
+        # Use glob to find all image files (jpg, png) in the directory
+        for img_file in glob(os.path.join(img_subset_dir, '*.jpg')) + glob(os.path.join(img_subset_dir, '*.png')):
+            # Assuming label file has same base name as image file
+            base_name = os.path.splitext(os.path.basename(img_file))[0]
+            label_file = os.path.join(label_subset_dir, base_name + '.txt')
+
+            if os.path.exists(label_file):
+                with open(label_file, 'r') as f_label:
+                    # Read first line to get the primary class for classification
+                    first_line = f_label.readline().strip()
+                    if first_line:
+                        class_id = int(first_line.split(' ')[0])
+                        image_paths.append(img_file)
+                        labels.append(class_id)
+
+        return image_paths, labels
+
+    print("\nLoading training data...")
+    train_image_paths, train_labels = load_subset_paths_and_labels('train')
+    print(f"Found {len(train_image_paths)} training images.")
+
+    print("\nLoading validation data...")
+    val_image_paths, val_labels = load_subset_paths_and_labels('val')
+    print(f"Found {len(val_image_paths)} validation images.")
+
+    print("\nLoading test data...")
+    test_image_paths, test_labels = load_subset_paths_and_labels('test') # Should be empty based on context
+    print(f"Found {len(test_image_paths)} test images.")
+
+    # If no test images, use validation images for testing as a fallback.
+    if not test_image_paths and val_image_paths:
+        print("No dedicated test set found; using validation set for testing.")
+        test_image_paths = val_image_paths
+        test_labels = val_labels
+
+    # Convert labels to tf.constant for use in `tf.py_function`
+    train_labels_tf = tf.constant(train_labels, dtype=tf.int32)
+    val_labels_tf = tf.constant(val_labels, dtype=tf.int32)
+    test_labels_tf = tf.constant(test_labels, dtype=tf.int32)
+
+    def preprocess_image_and_label(image_path, label):
+        def _preprocess_py_function(img_path, lbl):
+            img_path_str = img_path.numpy().decode('utf-8')
+            try:
+                img = tf.io.read_file(img_path_str)
+                img = tf.image.decode_image(img, channels=3)
+                img = tf.image.resize(img, [img_size, img_size])
+                img = img / 255.0  # Normalize to [0, 1]
+                return img, lbl
+            except tf.errors.InvalidArgumentError as e:
+                print(f"Skipping invalid image: {img_path_str}, Error: {e}")
+                return tf.zeros([img_size, img_size, 3], dtype=tf.float32), tf.constant(-1, dtype=tf.int32)
+            except Exception as e:
+                print(f"Skipping image due to unexpected error: {img_path_str}, Error: {e}")
+                return tf.zeros([img_size, img_size, 3], dtype=tf.float32), tf.constant(-1, dtype=tf.int32)
+
+        # Using tf.py_function within map
+        image, label = tf.py_function(
+            func=_preprocess_py_function,
+            inp=[image_path, label],
+            Tout=[tf.float32, tf.int32]
+        )
+        # Ensure shapes are explicitly set using tf.ensure_shape
+        image = tf.ensure_shape(image, [img_size, img_size, 3])
+        label = tf.ensure_shape(label, []) # Scalar label
+        return image, label
+
+    train_ds = tf.data.Dataset.from_tensor_slices((tf.constant(train_image_paths), train_labels_tf)).\
+        map(preprocess_image_and_label, num_parallel_calls=tf.data.AUTOTUNE).\
+        filter(lambda img, label: label != -1).\
+        batch(BATCH_SIZE).\
+        prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    val_ds = tf.data.Dataset.from_tensor_slices((tf.constant(val_image_paths), val_labels_tf)).\
+        map(preprocess_image_and_label, num_parallel_calls=tf.data.AUTOTUNE).\
+        filter(lambda img, label: label != -1).\
+        batch(BATCH_SIZE).\
+        prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    test_ds = tf.data.Dataset.from_tensor_slices((tf.constant(test_image_paths), test_labels_tf)).\
+        map(preprocess_image_and_label, num_parallel_calls=tf.data.AUTOTUNE).\
+        filter(lambda img, label: label != -1).\
+        batch(BATCH_SIZE).\
+        prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    return train_ds, val_ds, test_ds, num_classes, class_names, train_image_paths, val_image_paths, test_image_paths, train_labels, val_labels, test_labels
+
+# Call the function to parse the dataset and get the required variables
+train_ds, val_ds, test_ds, num_classes, class_names, train_image_paths, val_image_paths, test_image_paths, train_labels, val_labels, test_labels = parse_yolo_dataset(ACTUAL_DATA_ROOT, IMAGE_SIZE)
+
+print(f"\nDataset loading complete. Number of classes: {num_classes}")
+print(f"Class names: {class_names[:5]}...") # Print first 5 class names
+print(f"Train dataset elements: {tf.data.experimental.cardinality(train_ds).numpy()}")
+print(f"Validation dataset elements: {tf.data.experimental.cardinality(val_ds).numpy()}")
+print(f"Test dataset elements: {tf.data.experimental.cardinality(test_ds).numpy()}")
+
+model = models.Sequential([
+    layers.Conv2D(32, (3, 3), activation='relu', input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3)),
+    layers.MaxPooling2D((2, 2)),
+    layers.Conv2D(64, (3, 3), activation='relu'),
+    layers.MaxPooling2D((2, 2)),
+    layers.Conv2D(128, (3, 3), activation='relu'),
+    layers.MaxPooling2D((2, 2)),
+    layers.Flatten(),
+    layers.Dense(128, activation='relu'),
+    layers.Dense(num_classes, activation='softmax')
+])
+
+model.summary()
+
+# Compile the model
+model.compile(optimizer='adam',
+              loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+              metrics=['accuracy'])
+
+print("Starting model training...")
+history = model.fit(train_ds, epochs=10,
+                    validation_data=val_ds)
+
+# Evaluate the model
+print("\nEvaluating model on test data...")
+loss, accuracy = model.evaluate(test_ds, verbose=2)
+print(f"\nTest accuracy: {accuracy:.4f}")
+
+# Make predictions on a sample image
+# Get a random image from the test set paths
+if len(test_image_paths) == 0:
+    print("No test images available for prediction demonstration.")
+    # If test_ds was assigned val_ds and val_image_paths exists, use it
+    if len(val_ds) > 0 and 'val_image_paths' in globals() and len(val_image_paths) > 0:
+        print("Using a sample from the validation set for prediction demonstration.")
+        # Get a sample from the validation set to demonstrate prediction
+        random_index = np.random.randint(0, len(val_image_paths))
+        sample_image_path = val_image_paths[random_index]
+        sample_actual_label_id = val_labels[random_index]
+    else:
+        sample_image_path = None # No images to predict on
+else:
+    random_index = np.random.randint(0, len(test_image_paths))
+    sample_image_path = test_image_paths[random_index]
+    sample_actual_label_id = test_labels[random_index]
+
+if sample_image_path:
+    # Preprocess the sample image manually for prediction
+    img = tf.io.read_file(sample_image_path)
+    img = tf.image.decode_image(img, channels=3)
+    img = tf.image.resize(img, [IMAGE_SIZE, IMAGE_SIZE])
+    img_for_prediction = np.expand_dims(img / 255.0, axis=0) # Normalize and add batch dimension
+
+    predictions = model.predict(img_for_prediction)
+    predicted_class_index = np.argmax(predictions[0])
+    predicted_class_name = class_names[predicted_class_index]
+    confidence_score = np.max(predictions[0])
+
+    print(f"\nOriginal Image Label: {class_names[sample_actual_label_id]}")
+    print(f"Predicted Class: {predicted_class_name}")
+    print(f"Accuracy Score (Confidence): {confidence_score:.4f}")
+
+    # Display the image and prediction
+    plt.figure(figsize=(4,4))
+    plt.imshow(img.numpy().astype('uint8')) # Show original image (not normalized)
+    plt.title(f"Predicted: {predicted_class_name} (Confidence: {confidence_score:.2f})\nActual: {class_names[sample_actual_label_id]}")
+    plt.xticks([])
+    plt.yticks([])
+    plt.show()

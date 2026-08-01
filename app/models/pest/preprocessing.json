@@ -1,0 +1,13 @@
+{
+  "target_size": [
+    224,
+    224
+  ],
+  "normalization": "scale_0_to_1",
+  "channels": "RGB",
+  "model_input_shape": [
+    224,
+    224,
+    3
+  ]
+}
